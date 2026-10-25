@@ -390,7 +390,9 @@ static LONG WINAPI veh_filter(EXCEPTION_POINTERS *ep)
 }
 
 static BYTE *entity_obj(unsigned long long id, void **holder_out);
-static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out)
+/* exclude: a body to skip (the local player's when binding the avatar: both stand on the same spot
+ * after loading the same save, so the nearest body would otherwise be the player's own) */
+static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out, const BYTE *exclude)
 {
     void *holder = NULL;
     BYTE *obj = entity_obj(id, &holder);
@@ -415,7 +417,7 @@ static int find_body(unsigned long long id, BYTE **body_out, BYTE **mat_out)
                     if (n > sizeof chunk) n = sizeof chunk;
                     if (!safe_read(c, chunk, n)) continue;
                     for (k = 0; k + 4 <= n && k < 0x10000; k += 4) {
-                        if (*(unsigned *)(chunk + k) == vt && k + 0x1C <= n) {
+                        if (*(unsigned *)(chunk + k) == vt && k + 0x1C <= n && c + k != exclude) {
                             BYTE *m = *(BYTE **)(chunk + k + 0x18);
                             float f[3];
                             if (safe_read(m + 0x30, f, sizeof f)) {
@@ -494,7 +496,7 @@ static void native_cmd(const char *ln)
         *(float *)(*g_av_body_p + a) = fx; *(float *)(*g_av_body_p + a + 4) = fy; *(float *)(*g_av_body_p + a + 8) = fz;
         logf_("avvel: wrote %.2f %.2f %.2f at avatar body+0x%lx", fx, fy, fz, a);
     } else if (sscanf(ln, "findbody %llu", &id) == 1) {
-        find_body(id, &g_body, &g_bodymat);
+        find_body(id, &g_body, &g_bodymat, NULL);
     } else if (strncmp(ln, "posb", 4) == 0) {
         if (!g_bodymat || IsBadReadPtr(g_bodymat, 0x40) || *(unsigned *)g_body != (unsigned)(g_base + RVA_BODY_VTABLE)) logf_("posb: no valid cached body");
         else logf_("posb: %.3f %.3f %.3f", *(float *)(g_bodymat + 0x30), *(float *)(g_bodymat + 0x34), *(float *)(g_bodymat + 0x38));
@@ -623,18 +625,18 @@ typedef struct { unsigned magic, seq; float pos[3]; float dir[2]; } NetPkt;
 static SOCKET g_ns = INVALID_SOCKET;
 static struct sockaddr_in g_peer;
 static DWORD g_net_lastsend, g_net_lastlog, g_net_lastfind, g_net_lastrx;
-static unsigned g_net_seq, g_net_tx, g_net_rx;
+static unsigned g_net_seq, g_net_tx, g_net_rx, g_net_drop;
 static NetPkt g_remote;
 static unsigned long long g_av_id;
 static BYTE *g_av_body, *g_av_mat;
 static void av_init_ptr(void) { g_av_body_p = &g_av_body; }
-static float g_av_cur[3];
+static float g_av_cur[3], g_av_dir[2];
 static int g_av_have;
 static DWORD g_av_lastspawn, g_av_lastfind;
 
 static int av_valid(void)
 {
-    return g_av_mat && !IsBadWritePtr(g_av_mat, 0x40) && !IsBadReadPtr(g_av_body, 4) && *(unsigned *)g_av_body == (unsigned)(g_base + RVA_BODY_VTABLE);
+    return g_av_mat && g_av_body != g_body && !IsBadWritePtr(g_av_mat, 0x40) && !IsBadReadPtr(g_av_body, 4) && *(unsigned *)g_av_body == (unsigned)(g_base + RVA_BODY_VTABLE);
 }
 
 static void av_remove(void)
@@ -670,9 +672,10 @@ static void av_tick(DWORD now)
         return;
     }
     if (!av_valid()) {
+        if (!g_body) return;  /* need our own body first, so it can be excluded */
         if (now - g_av_lastfind < 1000) return;
         g_av_lastfind = now;
-        if (find_body(g_av_id, &g_av_body, &g_av_mat)) { g_av_have = 0; logf_("avatar body bound"); }
+        if (find_body(g_av_id, &g_av_body, &g_av_mat, g_body)) { g_av_have = 0; logf_("avatar body bound: %p (local body %p)", g_av_body, g_body); }
         return;
     }
     {
@@ -681,6 +684,30 @@ static void av_tick(DWORD now)
         if (!g_av_have || d > 6.0f) { memcpy(cur, tg, sizeof g_av_cur); g_av_have = 1; }
         else { cur[0] += (tg[0] - cur[0]) * 0.25f; cur[1] += (tg[1] - cur[1]) * 0.25f; cur[2] += (tg[2] - cur[2]) * 0.25f; }
         *(float *)(g_av_mat + 0x30) = cur[0]; *(float *)(g_av_mat + 0x34) = cur[1]; *(float *)(g_av_mat + 0x38) = cur[2];
+    }
+    /* heading: the body capsule never rotates and the avatar has no controller, so the entity matrix
+     * keeps whatever rotation is written into it (yaw only, rows (d0,d1,0) (-d1,d0,0) (0,0,1),
+     * the same layout as the player's) */
+    {
+        float dx = g_remote.dir[0], dy = g_remote.dir[1], n = sqrtf(dx * dx + dy * dy);
+        void *holder = NULL;
+        BYTE *obj;
+        if (n < 0.5f) return;
+        dx /= n; dy /= n;
+        if (!g_av_have || g_av_dir[0] * dx + g_av_dir[1] * dy < -0.9f) { g_av_dir[0] = dx; g_av_dir[1] = dy; }
+        else {
+            g_av_dir[0] += (dx - g_av_dir[0]) * 0.25f; g_av_dir[1] += (dy - g_av_dir[1]) * 0.25f;
+            n = sqrtf(g_av_dir[0] * g_av_dir[0] + g_av_dir[1] * g_av_dir[1]);
+            if (n < 1e-3f) { g_av_dir[0] = dx; g_av_dir[1] = dy; } else { g_av_dir[0] /= n; g_av_dir[1] /= n; }
+        }
+        obj = entity_obj(g_av_id, &holder);
+        if (obj && !IsBadWritePtr(obj + 0x30, 0x30)) {
+            float *r = (float *)(obj + 0x30);
+            r[0] = g_av_dir[0]; r[1] = g_av_dir[1]; r[2] = 0;
+            r[4] = -g_av_dir[1]; r[5] = g_av_dir[0]; r[6] = 0;
+            r[8] = 0; r[9] = 0; r[10] = 1;
+        }
+        if (holder) (*(int *)((BYTE *)holder + 8))--;
     }
 }
 
@@ -699,17 +726,20 @@ static void net_tick(void)
         struct sockaddr_in a;
         u_long nb = 1;
         WSAStartup(MAKEWORD(2, 2), &wd);
-        g_ns = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        memset(&a, 0, sizeof a);
-        a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK); a.sin_port = htons((unsigned short)g_net_lport);
-        if (bind(g_ns, (struct sockaddr *)&a, sizeof a) != 0) { logf_("net: bind %u failed (%d)", g_net_lport, WSAGetLastError()); closesocket(g_ns); g_ns = INVALID_SOCKET; g_net_cfg = 0; return; }
-        ioctlsocket(g_ns, FIONBIO, &nb);
         memset(&g_peer, 0, sizeof g_peer);
         g_peer.sin_family = AF_INET; g_peer.sin_addr.s_addr = inet_addr(g_net_pip); g_peer.sin_port = htons((unsigned short)g_net_pport);
-        g_net_seq = g_net_tx = g_net_rx = 0; g_net_lastsend = g_net_lastlog = now; g_net_lastrx = 0;
+        if (g_peer.sin_addr.s_addr == INADDR_NONE) { logf_("net: bad peer address %s", g_net_pip); g_net_cfg = 0; return; }
+        memset(&a, 0, sizeof a);
+        /* a peer on this PC (127.x) keeps the port on loopback; any other peer needs the port on the network */
+        a.sin_family = AF_INET; a.sin_port = htons((unsigned short)g_net_lport);
+        a.sin_addr.s_addr = (ntohl(g_peer.sin_addr.s_addr) >> 24) == 127 ? htonl(INADDR_LOOPBACK) : htonl(INADDR_ANY);
+        g_ns = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (bind(g_ns, (struct sockaddr *)&a, sizeof a) != 0) { logf_("net: bind %u failed (%d)", g_net_lport, WSAGetLastError()); closesocket(g_ns); g_ns = INVALID_SOCKET; g_net_cfg = 0; return; }
+        ioctlsocket(g_ns, FIONBIO, &nb);
+        g_net_seq = g_net_tx = g_net_rx = g_net_drop = 0; g_net_lastsend = g_net_lastlog = now; g_net_lastrx = 0;
         memset(&g_remote, 0, sizeof g_remote);
         g_net_cfg = 2;
-        logf_("net: socket up, local %u -> peer %s:%u", g_net_lport, g_net_pip, g_net_pport);
+        logf_("net: socket up, local %s:%u -> peer %s:%u", a.sin_addr.s_addr == htonl(INADDR_LOOPBACK) ? "127.0.0.1" : "0.0.0.0", g_net_lport, g_net_pip, g_net_pport);
     }
     if (g_walk && g_bodymat && !IsBadWritePtr(g_bodymat, 0x40)) {
         float t = (GetTickCount() - g_walk_t0) / 1000.0f;
@@ -730,12 +760,14 @@ static void net_tick(void)
             native_cmd(c);
         }
     }
-    /* receive everything pending */
+    /* receive everything pending; only packets from the peer's address count (the port may differ behind NAT) */
     for (;;) {
         NetPkt p;
-        int r = recvfrom(g_ns, (char *)&p, sizeof p, 0, NULL, NULL);
-        if (r != (int)sizeof p) break;
-        if (p.magic != NET_MAGIC) continue;
+        struct sockaddr_in from;
+        int fl = sizeof from;
+        int r = recvfrom(g_ns, (char *)&p, sizeof p, 0, (struct sockaddr *)&from, &fl);
+        if (r == SOCKET_ERROR) { if (WSAGetLastError() == WSAEMSGSIZE) { g_net_drop++; continue; } break; }
+        if (r != (int)sizeof p || p.magic != NET_MAGIC || from.sin_addr.s_addr != g_peer.sin_addr.s_addr) { g_net_drop++; continue; }
         g_remote = p; g_net_rx++; g_net_lastrx = now;
     }
     av_tick(now);
@@ -754,9 +786,9 @@ static void net_tick(void)
     }
     if (now - g_net_lastlog >= 1000) {
         g_net_lastlog = now;
-        logf_("net: tx=%u rx=%u local=(%.2f %.2f %.2f) remote=(%.2f %.2f %.2f) seq=%u age=%lums", g_net_tx, g_net_rx,
+        logf_("net: tx=%u rx=%u local=(%.2f %.2f %.2f) remote=(%.2f %.2f %.2f) seq=%u age=%lums drop=%u", g_net_tx, g_net_rx,
               g_bodymat ? *(float *)(g_bodymat + 0x30) : 0, g_bodymat ? *(float *)(g_bodymat + 0x34) : 0, g_bodymat ? *(float *)(g_bodymat + 0x38) : 0,
-              g_remote.pos[0], g_remote.pos[1], g_remote.pos[2], g_remote.seq, g_net_lastrx ? (unsigned long)(now - g_net_lastrx) : 0UL);
+              g_remote.pos[0], g_remote.pos[1], g_remote.pos[2], g_remote.seq, g_net_lastrx ? (unsigned long)(now - g_net_lastrx) : 0UL, g_net_drop);
     }
 }
 

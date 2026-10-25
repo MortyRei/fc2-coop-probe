@@ -3,3 +3,6 @@
 *.log
 coop_cmd.lua
 coop_native.txt
+scripts/steam-run/
+relay/steam-run/
+__pycache__/
